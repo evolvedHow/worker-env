@@ -33,22 +33,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # get <namespace>/<key>
+    # get <context>/<key> or <key>
     get_cmd = subparsers.add_parser("get", help="Retrieve a secret")
-    get_cmd.add_argument("path", help="Secret path (namespace/key)")
+    get_cmd.add_argument("path", help="Secret path (context/key or just key for default)")
 
-    # set <namespace>/<key> <value>
-    set_cmd = subparsers.add_parser("set", help="Create or update a secret")
-    set_cmd.add_argument("path", help="Secret path (namespace/key)")
-    set_cmd.add_argument("value", nargs="?", help="Secret value (reads from stdin if omitted)")
-
-    # delete <namespace>/<key>
-    delete_cmd = subparsers.add_parser("delete", help="Delete a secret")
-    delete_cmd.add_argument("path", help="Secret path (namespace/key)")
-
-    # list [namespace]
+    # list [context]
     list_cmd = subparsers.add_parser("list", help="List secrets")
-    list_cmd.add_argument("namespace", nargs="?", help="Optional namespace filter")
+    list_cmd.add_argument("context", nargs="?", help="Optional context filter")
 
     # gentoken
     subparsers.add_parser("gentoken", help="Generate a random bearer token")
@@ -56,22 +47,26 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parse_path(path: str) -> tuple[str, str]:
-    """Parse a namespace/key path.
+def _parse_path(path: str) -> tuple[str | None, str]:
+    """Parse a context/key path.
 
     Args:
-        path: Path in format "namespace/key".
+        path: Path in format "context/key" or just "key" (for default context).
 
     Returns:
-        Tuple of (namespace, key).
+        Tuple of (context, key). Context is None if only key is provided.
 
     Raises:
         SystemExit: If the path format is invalid.
     """
     parts = path.split("/", 1)
-    if len(parts) != 2:
-        raise SystemExit(f"Invalid path '{path}': expected 'namespace/key'")
-    return parts[0], parts[1]
+    if len(parts) == 1:
+        # Just a key, use default context
+        return None, parts[0]
+    if len(parts) == 2:
+        # context/key format
+        return parts[0], parts[1]
+    raise SystemExit(f"Invalid path '{path}': expected 'context/key' or 'key'")
 
 
 def _run_get(url: str, token: str, path: str) -> int:
@@ -80,15 +75,17 @@ def _run_get(url: str, token: str, path: str) -> int:
     Args:
         url: Vault base URL.
         token: Bearer token for authentication.
-        path: Secret path (namespace/key).
+        path: Secret path (context/key or just key for default).
 
     Returns:
         Process exit code.
     """
-    namespace, key = _parse_path(path)
+    context, key = _parse_path(path)
     try:
+        endpoint = f"{url}/secrets/{context}/{key}" if context else f"{url}/secrets/{key}"
+
         response = httpx.get(
-            f"{url}/secrets/{namespace}/{key}",
+            endpoint,
             headers={"Authorization": f"Bearer {token}"},
             timeout=10.0,
         )
@@ -107,87 +104,18 @@ def _run_get(url: str, token: str, path: str) -> int:
         return 1
 
 
-def _run_set(url: str, token: str, path: str, value: str | None) -> int:
-    """Create or update a secret.
-
-    Args:
-        url: Vault base URL.
-        token: Bearer token for authentication.
-        path: Secret path (namespace/key).
-        value: Secret value (or None to read from stdin).
-
-    Returns:
-        Process exit code.
-    """
-    namespace, key = _parse_path(path)
-    actual_value = value if value is not None else sys.stdin.read().strip()
-
-    try:
-        response = httpx.put(
-            f"{url}/secrets/{namespace}/{key}",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"value": actual_value},
-            timeout=10.0,
-        )
-        response.raise_for_status()
-        secret = response.json()
-        print(f"Secret '{namespace}/{key}' updated at {secret['updated_at']}")
-        return 0
-    except httpx.HTTPStatusError as exc:
-        print(
-            f"Error: {exc.response.status_code} - {exc.response.json().get('detail', 'Unknown error')}",
-            file=sys.stderr,
-        )
-        return 1
-    except httpx.RequestError as exc:
-        print(f"Error: Failed to connect to vault: {exc}", file=sys.stderr)
-        return 1
-
-
-def _run_delete(url: str, token: str, path: str) -> int:
-    """Delete a secret.
-
-    Args:
-        url: Vault base URL.
-        token: Bearer token for authentication.
-        path: Secret path (namespace/key).
-
-    Returns:
-        Process exit code.
-    """
-    namespace, key = _parse_path(path)
-    try:
-        response = httpx.delete(
-            f"{url}/secrets/{namespace}/{key}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10.0,
-        )
-        response.raise_for_status()
-        print(f"Secret '{namespace}/{key}' deleted")
-        return 0
-    except httpx.HTTPStatusError as exc:
-        print(
-            f"Error: {exc.response.status_code} - {exc.response.json().get('detail', 'Unknown error')}",
-            file=sys.stderr,
-        )
-        return 1
-    except httpx.RequestError as exc:
-        print(f"Error: Failed to connect to vault: {exc}", file=sys.stderr)
-        return 1
-
-
-def _run_list(url: str, token: str, namespace: str | None) -> int:
+def _run_list(url: str, token: str, context: str | None) -> int:
     """List secrets.
 
     Args:
         url: Vault base URL.
         token: Bearer token for authentication.
-        namespace: Optional namespace filter.
+        context: Optional context filter.
 
     Returns:
         Process exit code.
     """
-    params = {"namespace": namespace} if namespace else {}
+    params = {"context": context} if context else {}
     try:
         response = httpx.get(
             f"{url}/secrets",
@@ -201,8 +129,18 @@ def _run_list(url: str, token: str, namespace: str | None) -> int:
             print("No secrets found")
             return 0
 
+        rows: list[tuple[str, str, str, int]] = []
         for secret in data["secrets"]:
-            print(f"{secret['namespace']}/{secret['key']:<40} (updated: {secret['updated_at']})")
+            name = f"{secret['context']}/{secret['key']}"
+            label = secret.get("label", "")
+            rows.append((name, label, secret["updated_at"], secret.get("update_count", 0)))
+
+        width = max((len(name) for name, *_ in rows), default=0)
+        for name, label, updated, update_count in rows:
+            label_display = f" - {label}" if label else ""
+            print(f"{name:<{width}}{label_display}")
+            print(f"  └─ updated: {updated} (count: {update_count})")
+
         print(f"\nTotal: {data['count']} secrets")
         return 0
     except httpx.HTTPStatusError as exc:
@@ -226,7 +164,8 @@ def _run_gentoken() -> int:
     payload = {
         "bearer_token": token,
         "next_steps": [
-            "Set VAULT_BEARER_TOKEN in wrangler.toml [vars]",
+            "Production: npx wrangler secret put VAULT_BEARER_TOKEN",
+            'Local dev: echo "VAULT_BEARER_TOKEN=<token>" > .dev.vars',
             "Set VAULT_TOKEN and VAULT_URL in your environment for CLI access",
             "Store the token securely in ~/docker/stack/.env; never commit it",
         ],
@@ -260,12 +199,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "get":
         return _run_get(url, args.token, args.path)
-    if args.command == "set":
-        return _run_set(url, args.token, args.path, args.value)
-    if args.command == "delete":
-        return _run_delete(url, args.token, args.path)
     if args.command == "list":
-        return _run_list(url, args.token, args.namespace)
+        return _run_list(url, args.token, args.context)
 
     raise SystemExit(f"unknown command {args.command!r}")
 

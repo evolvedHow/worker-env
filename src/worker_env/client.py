@@ -1,195 +1,194 @@
-"""HTTP client that signs every request before calling the vault."""
+"""HTTP client for the read-only Cloudflare Worker vault."""
 
-import json
-from typing import Any, cast
+from typing import Self
 
 import httpx
 
-from worker_env.errors import VaultError
-from worker_env.models import Context, ContextCreate, ContextUpdate
-from worker_env.signing import (
-    SIGNATURE_HEADER,
-    TIMESTAMP_HEADER,
-    current_timestamp,
-    sign_request,
-)
+from worker_env.errors import AuthenticationError, SecretNotFoundError, VaultError
+from worker_env.models import Secret, SecretList
 
-CLIENT_ERROR_STATUS = 400
+# HTTP status codes
+HTTP_UNAUTHORIZED = 401
+HTTP_NOT_FOUND = 404
+SECRETS_PATH_PREFIX = "/secrets/"
+
+# Path segment counts for "/secrets/..." request paths
+NAMED_CONTEXT_PATH_SEGMENTS = 3
+DEFAULT_CONTEXT_PATH_SEGMENTS = 2
 
 
-class VaultClient:
-    """Ed25519-signing HTTP client for the Cloudflare vault Worker.
+class SecretClient:
+    """Read-only synchronous HTTP client for the vault.
 
-    A single client owns one pooled :class:`httpx.AsyncClient`, so
-    connections are reused across calls and every request carries a fresh
-    signature over its exact method, path, and body bytes.
+    This client provides a Python interface to the Cloudflare Worker vault API,
+    using bearer token authentication for all requests. The vault is read-only:
+    it only exposes ``get()`` and ``list()``.
+
+    Example:
+        >>> client = SecretClient(
+        ...     base_url="https://vault.example.workers.dev",
+        ...     token="your-bearer-token",
+        ... )
+        >>> secret = client.get("homelab", "github-token")
+        >>> print(secret.value)
+        ghp_...
+        >>> for item in client.list("homelab"):
+        ...     print(f"{item.context}/{item.key}")
+
+    Attributes:
+        base_url: Base URL of the deployed vault Worker.
+        timeout: Request timeout in seconds.
     """
 
     def __init__(
         self,
         base_url: str,
-        private_key: bytes,
+        token: str,
         *,
-        transport: httpx.AsyncBaseTransport | None = None,
         timeout: float = 10.0,
     ) -> None:
-        """Create a signing client for a vault URL.
+        """Create a vault client with bearer token authentication.
 
         Args:
-            base_url: Base URL of the deployed vault Worker.
-            private_key: Raw 32-byte Ed25519 private key used to sign requests.
-            transport: Optional transport override, used by tests.
-            timeout: Per-request timeout in seconds.
+            base_url: Base URL of the vault (e.g., "https://vault.workers.dev").
+            token: Bearer token for authentication.
+            timeout: HTTP request timeout in seconds (default: 10.0).
         """
-        self._private_key = private_key
-        self._http = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
-            transport=transport,
-            timeout=timeout,
-            follow_redirects=False,
-        )
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._token = token
+        self._client = httpx.Client(timeout=timeout)
 
-    async def aclose(self) -> None:
-        """Close the underlying connection pool."""
-        await self._http.aclose()
+    def __enter__(self) -> Self:
+        """Support context manager protocol."""
+        return self
 
-    async def _request(
+    def __exit__(self, *args: object) -> None:
+        """Close the HTTP client on context manager exit."""
+        self.close()
+
+    def close(self) -> None:
+        """Close the underlying HTTP connection pool.
+
+        It's recommended to use the client as a context manager to ensure
+        proper cleanup, or explicitly call this method when done.
+        """
+        self._client.close()
+
+    def _get(
         self,
-        method: str,
         path: str,
         *,
-        payload: ContextCreate | ContextUpdate | None = None,
-    ) -> dict[str, Any]:
-        """Send one signed request and return the decoded JSON object.
+        params: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """Send an authenticated GET request to the vault.
 
         Args:
-            method: HTTP method to send.
-            path: Request path including any query string.
-            payload: Optional Pydantic model serialised as the JSON body.
+            path: Request path (e.g., "/secrets/homelab/key").
+            params: Optional query parameters.
 
         Returns:
-            The decoded JSON response body as a mapping.
+            The HTTP response object.
 
         Raises:
-            VaultError: If the vault answers with an HTTP error status.
+            VaultError: If the vault returns an error response.
+            AuthenticationError: If authentication fails (401).
+            SecretNotFoundError: If a secret is not found (404).
         """
-        if payload is None:
-            body = b""
+        url = f"{self.base_url}{path}"
+        headers = {"Authorization": f"Bearer {self._token}"}
+
+        try:
+            response = self._client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            detail = self._extract_detail(exc.response)
+
+            if status_code == HTTP_UNAUTHORIZED:
+                raise AuthenticationError(detail) from exc
+            if status_code == HTTP_NOT_FOUND and path.startswith(SECRETS_PATH_PREFIX):
+                # Strip the leading slash and split into segments; the first
+                # segment is always the literal "secrets" resource name.
+                parts = path.strip("/").split("/")
+                if len(parts) == NAMED_CONTEXT_PATH_SEGMENTS:
+                    raise SecretNotFoundError(parts[1], parts[2]) from exc
+                if len(parts) == DEFAULT_CONTEXT_PATH_SEGMENTS:
+                    raise SecretNotFoundError(None, parts[1]) from exc
+            raise VaultError(status_code, detail) from exc
+        except httpx.RequestError as exc:
+            raise VaultError(0, f"Connection error: {exc}") from exc
         else:
-            body = json.dumps(
-                payload.model_dump(mode="json"),
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        timestamp = current_timestamp()
-        headers = {
-            TIMESTAMP_HEADER: str(timestamp),
-            SIGNATURE_HEADER: sign_request(
-                self._private_key,
-                timestamp,
-                method,
-                path,
-                body,
-            ),
-        }
-        if body:
-            headers["Content-Type"] = "application/json"
-        response = await self._http.request(
-            method,
-            path,
-            content=body,
-            headers=headers,
-        )
-        if response.status_code >= CLIENT_ERROR_STATUS:
-            raise VaultError(response.status_code, self._error_detail(response))
-        if not response.content:
-            return {}
-        data = response.json()
-        if not isinstance(data, dict):
-            raise VaultError(response.status_code, "vault returned a non-object JSON body")
-        return data
+            return response
 
     @staticmethod
-    def _error_detail(response: httpx.Response) -> str:
-        """Extract a human-readable detail string from an error response.
+    def _extract_detail(response: httpx.Response) -> str:
+        """Extract error detail from a vault response.
 
         Args:
-            response: Error response returned by the vault.
+            response: HTTP error response from the vault.
 
         Returns:
-            The vault's ``detail`` field, or a generic status description.
+            Human-readable error message.
         """
         try:
-            payload = response.json()
-        except ValueError:
-            payload = None
-        if isinstance(payload, dict):
-            detail = payload.get("detail")
-            if isinstance(detail, str) and detail:
-                return detail
-        return f"vault returned status {response.status_code}"
+            data = response.json()
+            if isinstance(data, dict) and "detail" in data:
+                return str(data["detail"])
+        except (ValueError, KeyError):
+            # JSON decode failed or detail missing - fall through to default
+            pass
+        return f"HTTP {response.status_code}"
 
-    async def create(self, payload: ContextCreate) -> Context:
-        """Create a context in the vault.
+    def get(self, context: str | None, key: str) -> Secret:
+        """Retrieve a secret from the vault.
 
         Args:
-            payload: Validated creation payload.
+            context: Context containing the secret (None for default context).
+            key: Secret key to retrieve.
 
         Returns:
-            The stored context record.
-        """
-        data = await self._request("POST", "/contexts", payload=payload)
-        return Context.model_validate(data)
-
-    async def get(self, namespace: str, name: str) -> Context:
-        """Fetch a single context, incrementing its usage counter.
-
-        Args:
-            namespace: Namespace owning the context.
-            name: Context name.
-
-        Returns:
-            The stored context record with the updated usage counter.
-        """
-        data = await self._request("GET", f"/contexts/{namespace}/{name}")
-        return Context.model_validate(data)
-
-    async def list_contexts(self, namespace: str | None = None) -> list[Context]:
-        """List contexts without touching usage counters.
-
-        Args:
-            namespace: Optional namespace filter.
-
-        Returns:
-            The matching context records.
-        """
-        path = "/contexts" if namespace is None else f"/contexts?namespace={namespace}"
-        data = await self._request("GET", path)
-        items = cast("list[Any]", data.get("contexts", []))
-        return [Context.model_validate(item) for item in items]
-
-    async def update(self, namespace: str, name: str, patch: ContextUpdate) -> Context:
-        """Update the mutable fields of a context.
-
-        Args:
-            namespace: Namespace owning the context.
-            name: Context name.
-            patch: Payload containing ``label`` and/or ``value``.
-
-        Returns:
-            The updated context record.
-        """
-        data = await self._request("PATCH", f"/contexts/{namespace}/{name}", payload=patch)
-        return Context.model_validate(data)
-
-    async def delete(self, namespace: str, name: str) -> None:
-        """Delete a context from the vault.
-
-        Args:
-            namespace: Namespace owning the context.
-            name: Context name.
+            The secret with its metadata.
 
         Raises:
-            VaultError: If the vault answers with an HTTP error status.
+            SecretNotFoundError: If the secret does not exist.
+            AuthenticationError: If the bearer token is invalid.
+            VaultError: If the vault returns any other error.
+
+        Example:
+            >>> secret = client.get("homelab", "github-token")
+            >>> print(f"Value: {secret.value}")
+            >>> print(f"Label: {secret.label}")
+            >>> print(f"Updated: {secret.updated_at}")
+            >>>
+            >>> # Get from default context
+            >>> secret = client.get(None, "example-key")
         """
-        await self._request("DELETE", f"/contexts/{namespace}/{name}")
+        path = f"/secrets/{context}/{key}" if context else f"/secrets/{key}"
+
+        response = self._get(path)
+        return Secret.model_validate(response.json())
+
+    def list(self, context: str | None = None) -> list[Secret]:
+        """List secrets, optionally filtered by context.
+
+        Args:
+            context: Optional context to filter by. If None, returns all secrets.
+
+        Returns:
+            List of secrets matching the query. Returns empty list if no secrets found.
+
+        Raises:
+            AuthenticationError: If the bearer token is invalid.
+            VaultError: If the vault returns an error.
+
+        Example:
+            >>> all_secrets = client.list()
+            >>> homelab_secrets = client.list("homelab")
+            >>> for secret in homelab_secrets:
+            ...     print(f"{secret.context}/{secret.key}: {secret.label}")
+        """
+        params = {"context": context} if context else None
+        response = self._get("/secrets", params=params)
+        secret_list = SecretList.model_validate(response.json())
+        return secret_list.secrets

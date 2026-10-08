@@ -1,0 +1,23 @@
+name = "worker-env-vault"
+main = "worker/index.py"
+compatibility_date = "2025-11-02"
+compatibility_flags = ["python_workers"]
+
+# Bundle the secret CSV files (below worker/) as text modules so the Worker
+# can read and list them from the virtual file system at runtime.
+[[rules]]
+type = "Text"
+globs = ["secrets/*.csv"]
+fallthrough = true
+
+# Authentication token for the API. Do NOT define it in [vars] — a plaintext
+# placeholder would collide with the encrypted secret on deploy.
+# Production:  npx wrangler secret put VAULT_BEARER_TOKEN
+# Local dev:   echo "VAULT_BEARER_TOKEN=<token>" > .dev.vars
+# The vault fails closed (every request returns 401) while the token is unset.
+# Declaring it here makes `wrangler deploy` fail fast if the secret is missing.
+[secrets]
+required = ["VAULT_BEARER_TOKEN"]
+
+[observability]
+enabled = true
