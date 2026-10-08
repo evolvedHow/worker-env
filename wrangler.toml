@@ -15,9 +15,6 @@ fallthrough = true
 # Production:  npx wrangler secret put VAULT_BEARER_TOKEN
 # Local dev:   echo "VAULT_BEARER_TOKEN=<token>" > .dev.vars
 # The vault fails closed (every request returns 401) while the token is unset.
-# Declaring it here makes `wrangler deploy` fail fast if the secret is missing.
-[secrets]
-required = ["VAULT_BEARER_TOKEN"]
 
 [observability]
 enabled = true
