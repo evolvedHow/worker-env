@@ -1,19 +1,28 @@
 [project]
 name = "worker-env"
 version = "0.1.0"
-description = "Secure Cloudflare-backed context vault with Ed25519-signed API access"
+description = "Minimal secret vault on Cloudflare Workers with Python client and CLI"
 readme = "README.md"
 requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "vgana"}
+]
+keywords = ["vault", "secrets", "cloudflare", "workers", "csv"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
-    "cryptography>=43.0",
-    "fastapi>=0.115",
     "httpx>=0.27",
     "pydantic>=2.9",
-    "uvicorn[standard]>=0.30",
 ]
-
-[project.optional-dependencies]
-modal = ["modal>=0.64"]
 
 [project.scripts]
 vault = "worker_env.cli:main"
@@ -56,9 +65,13 @@ ignore = [
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"src/worker_env/signing.py" = ["PLR0913"]
-"tests/*" = ["ANN401", "ARG", "D", "PLR0913", "PLR2004", "S101", "S104"]
+"tests/*" = ["ANN", "ARG", "D", "PGH003", "PLR0913", "PLR2004", "S101", "S104", "S105", "S106"]
 "src/worker_env/cli.py" = ["E501", "ERA001", "PLR0911", "PLR2004", "T201", "TRY300"]
+"examples/*" = ["BLE001", "D", "INP001", "S106", "T201", "TRY300"]
+"examples/basic_usage.py" = ["T201"]
+"examples/environment_sync.py" = ["T201", "BLE001"]
+"examples/error_handling.py" = ["T201", "TRY300"]
+"worker/*.py" = ["ANN", "C901", "INP001", "PLR0911", "PLR2004", "PLW0603", "T201"]
 
 [tool.ruff.format]
 quote-style = "double"
