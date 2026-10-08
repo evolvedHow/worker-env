@@ -23,3 +23,4 @@ worker/secrets/*.csv
 # Cloudflare Worker
 node_modules/
 worker/.wrangler/
+.wrangler/
