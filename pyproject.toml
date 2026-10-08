@@ -1,0 +1,78 @@
+[project]
+name = "worker-env"
+version = "0.1.0"
+description = "Secure Cloudflare-backed context vault with Ed25519-signed API access"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=43.0",
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+modal = ["modal>=0.64"]
+
+[project.scripts]
+vault = "worker_env.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "ruff>=0.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/worker_env"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "CPY001",
+    "D203",
+    "D213",
+    "DTZ005",
+    "EM101",
+    "EM102",
+    "FBT001",
+    "FBT002",
+    "TRY003",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"src/worker_env/signing.py" = ["PLR0913"]
+"tests/*" = ["ANN401", "ARG", "D", "PLR0913", "PLR2004", "S101", "S104"]
+"src/worker_env/cli.py" = ["E501", "ERA001", "PLR0911", "PLR2004", "T201", "TRY300"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+mypy_path = "src"
+packages = ["worker_env"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
