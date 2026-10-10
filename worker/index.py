@@ -1,7 +1,9 @@
 """CSV-based secret vault on Cloudflare Workers.
 
-Loads secrets from per-context CSV files at cold start and serves them
-over a read-only HTTP API with bearer token authentication.
+Serves secrets from per-context CSV files over a read-only HTTP API with bearer
+token authentication. The default (blank) context is read once at cold start and
+cached; named contexts are read lazily on first access and cached for the life
+of the isolate.
 
 File layout (bundled below the worker entry point):
 
@@ -9,6 +11,11 @@ File layout (bundled below the worker entry point):
     worker/secrets/{context}.secrets.csv   -> named context
 
 CSV columns: key,value,label,update_count,updated_at
+
+Lookups are context-overlaid on the default (blank) context: a request for
+``{context}/{key}`` returns the value defined in that context, or the
+default-context value when the named context does not define the key. Contexts
+are named after the app (repo/product name, lowercase, e.g. "yuktiai").
 """
 
 import csv
@@ -31,9 +38,11 @@ LIST_PATH_SEGMENTS = 1
 SECRET_PATH_SEGMENTS = 3
 KEY_PATH_SEGMENTS = 2
 
-# In-memory store: {context: {key: secret_record}}
+# In-memory cache: {context: {key: secret_record}}. The default (blank) context
+# is primed on the first request and kept for the life of the isolate; named
+# contexts are read lazily on first access and cached thereafter, so a fallback
+# to the default never re-reads its CSV.
 _store: dict[str, dict[str, dict[str, Any]]] = {}
-_loaded = False
 
 
 def _parse_update_count(raw: Any) -> int:
@@ -98,23 +107,66 @@ def _safe_read_csv(csv_path: Path, context: str) -> dict[str, dict[str, Any]]:
         return {}
 
 
-def _load_secrets() -> None:
-    """Load every CSV in the secrets folder into the in-memory store.
+def _context_path(context: str) -> Path:
+    """Return the CSV path that backs a context.
 
-    Reads secrets.csv for the default context and one file per named
-    context. Runs once per worker isolate. A malformed or unreadable file is
-    skipped so the worker keeps serving the remaining contexts instead of
-    failing every request.
+    Args:
+        context: Context name (the default context when "default").
+
+    Returns:
+        Path to the context's CSV file, which may not exist.
     """
-    global _loaded
+    if context == DEFAULT_CONTEXT:
+        return SECRETS_DIR / DEFAULT_CSV
+    return SECRETS_DIR / f"{context}{CONTEXT_SUFFIX}"
+
+
+def _load_context(context: str) -> dict[str, dict[str, Any]]:
+    """Read one context from disk and cache it in the in-memory store.
+
+    A context whose file is absent caches as empty, so a missing context is not
+    re-stat'd on every request. Runs at most once per context per isolate. A
+    malformed or unreadable file is skipped (cached as empty) so the worker
+    keeps serving the remaining contexts instead of failing every request.
+
+    Args:
+        context: Context name to load.
+
+    Returns:
+        The freshly loaded, now-cached secrets for the context.
+    """
+    csv_path = _context_path(context)
+    secrets = _safe_read_csv(csv_path, context) if csv_path.is_file() else {}
+    _store[context] = secrets
+    return secrets
+
+
+def _context(context: str) -> dict[str, dict[str, Any]]:
+    """Return a context's secrets, reading and caching it on first access.
+
+    Args:
+        context: Context name.
+
+    Returns:
+        The cached secrets for the context.
+    """
+    cached = _store.get(context)
+    if cached is not None:
+        return cached
+    return _load_context(context)
+
+
+def _load_all_contexts() -> None:
+    """Cache every on-disk context, priming the default context first.
+
+    Used by the listing route, which needs all contexts. The default (blank)
+    context is always loaded; named contexts are discovered from
+    ``*.secrets.csv`` and cached if not already present.
+    """
+    _context(DEFAULT_CONTEXT)
     if SECRETS_DIR.is_dir():
-        default_csv = SECRETS_DIR / DEFAULT_CSV
-        if default_csv.is_file():
-            _store[DEFAULT_CONTEXT] = _safe_read_csv(default_csv, DEFAULT_CONTEXT)
         for csv_path in sorted(SECRETS_DIR.glob(f"*{CONTEXT_SUFFIX}")):
-            context = csv_path.name.removesuffix(CONTEXT_SUFFIX)
-            _store[context] = _safe_read_csv(csv_path, context)
-    _loaded = True
+            _context(csv_path.name.removesuffix(CONTEXT_SUFFIX))
 
 
 def _json(body: Any, status: int = 200) -> Response:
@@ -158,8 +210,7 @@ class Default(WorkerEntrypoint):
         Returns:
             The HTTP response for the request.
         """
-        if not _loaded:
-            _load_secrets()
+        _context(DEFAULT_CONTEXT)
 
         parsed_url = urlparse(str(request.url))
         method = str(request.method).upper()
@@ -211,16 +262,22 @@ class Default(WorkerEntrypoint):
         return hmac.compare_digest(str(auth_header), f"Bearer {token}")
 
     def _get_secret(self, context: str, key: str) -> Response:
-        """Return a single secret record.
+        """Return a single secret record, falling back to the default context.
+
+        The default (blank) context overlays every named context: when the key
+        is absent from the requested context it is read from the default context
+        if defined there. A named-context value always wins over the default.
 
         Args:
             context: Context name (default context when "default").
             key: Secret key within the context.
 
         Returns:
-            The secret record, or 404 when it does not exist.
+            The secret record, or 404 when it is defined in neither context.
         """
-        secret = _store.get(context, {}).get(key)
+        secret = _context(context).get(key)
+        if secret is None and context != DEFAULT_CONTEXT:
+            secret = _context(DEFAULT_CONTEXT).get(key)
         if secret is None:
             return _json({"detail": f"Secret '{context}/{key}' not found"}, 404)
         return _json(secret)
@@ -234,6 +291,7 @@ class Default(WorkerEntrypoint):
         Returns:
             Envelope with the matching secrets and their count.
         """
+        _load_all_contexts()
         context_filter = parse_qs(query).get("context", [None])[0]
         secrets: list[dict[str, Any]] = []
         for context, entries in _store.items():

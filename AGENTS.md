@@ -43,9 +43,16 @@ npm run deploy                                 # deploy to Cloudflare (repo root
 
 - **Schema**: `{context, key, value, label, update_count, updated_at}`.
   Context derived from CSV filename (e.g., `homelab.secrets.csv` → "homelab").
+- **Context naming**: name a context after its app — the repo/product name,
+  lowercase and joined (e.g., `yuktiAI` → `yuktiai.secrets.csv`). Callers pass
+  that name as the context on every request.
+- **Default fallback**: `GET /secrets/{context}/{key}` serves the default
+  (`secrets.csv`) value when the named context omits the key; a named-context
+  value always wins when both define it.
 - **CSV format**: `key,value,label,update_count,updated_at` (no context column).
-- **Storage**: CSVs in `worker/secrets/`, loaded into memory on cold start.
-  A CSV edit is picked up live by `wrangler dev`; production needs redeploy.
+- **Storage**: CSVs in `worker/secrets/`. The default context is cached at cold
+  start; each named context is cached on first access. Production needs redeploy
+  after edits; `wrangler dev` restarts the isolate so edits are picked up.
 - **Read-only**: No PUT/DELETE operations (worker returns 405). Update secrets
   by editing CSV + redeploy.
 - **Authentication**: Bearer token in `Authorization` header. Production token
@@ -53,7 +60,8 @@ npm run deploy                                 # deploy to Cloudflare (repo root
   `.dev.vars` at the repo root (git-ignored). Vault fails closed (401) while
   the token is unset.
 - **Routes**: `GET /health` (unauthenticated), `GET /secrets[?context=...]`,
-  `GET /secrets/{context}/{key}`, `GET /secrets/{key}` (default context).
+  `GET /secrets/{context}/{key}` (falls back to the default context),
+  `GET /secrets/{key}` (default context).
 - **Telemetry**: Cloudflare-native observability (no custom KV analytics).
 - **Secrets storage**: Actual secrets in `~/docker/stack/secrets/`, never
   commit. All `worker/secrets/*.csv` are git-ignored (`.gitkeep` tracked).

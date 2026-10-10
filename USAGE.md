@@ -211,8 +211,16 @@ npm run deploy
 - **homelab** - Personal infrastructure secrets (databases, self-hosted services)
 - **finance** - Financial service credentials (Stripe, Plaid, banking APIs)
 - **commerce** - Storefront and payment credentials (Shopify, email providers)
-- **<project>** - Project-specific secrets (e.g., `myapp-prod`, `myapp-dev`)
+- **<project>** - The app's repo or product name, lowercase and joined (e.g., `yuktiAI` → `yuktiai`)
 - **default** (`secrets.csv`) - Shared secrets used across contexts
+
+**Name the context after the app.** Every call should pass the repo/product
+name lowercased as the context (`vault get yuktiai/KEY_GROQ`).
+
+**Default-context fallback.** A lookup for `{context}/{key}` returns the named
+context's value if it defines that key; otherwise it falls back to the default
+(`secrets.csv`) value. A named-context value always wins, so put shared keys in
+`secrets.csv` and override them per app only when they differ.
 
 ### Naming Conventions
 

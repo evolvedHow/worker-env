@@ -166,6 +166,50 @@ def test_missing_secret_returns_404(worker: types.ModuleType) -> None:
     assert _call(worker, request).status == 404
 
 
+@pytest.fixture
+def overlapped_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    """A Worker module where the default context shares a key with a named one."""
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    _write(
+        secrets_dir / "secrets.csv",
+        [
+            CSV_HEADER,
+            "example-key,default-value,Default example,1,2026-01-01T00:00:00Z",
+            "shared-key,from-default,Shared default,1,2026-01-01T00:00:00Z",
+        ],
+    )
+    _write(
+        secrets_dir / "yuktiai.secrets.csv",
+        [CSV_HEADER, "shared-key,from-context,Shared context,1,2026-01-01T00:00:00Z"],
+    )
+    return _load_worker(monkeypatch, secrets_dir)
+
+
+def test_named_context_precedence(overlapped_worker: types.ModuleType) -> None:
+    """A key defined in the named context is not overridden by the default."""
+    request = FakeRequest("http://vault/secrets/yuktiai/shared-key", headers=AUTH_HEADER)
+    response = _call(overlapped_worker, request)
+    assert response.status == 200
+    assert response.json()["value"] == "from-context"
+    assert response.json()["context"] == "yuktiai"
+
+
+def test_named_context_falls_back_to_default(overlapped_worker: types.ModuleType) -> None:
+    """A key absent from the named context is served from the default context."""
+    request = FakeRequest("http://vault/secrets/yuktiai/example-key", headers=AUTH_HEADER)
+    response = _call(overlapped_worker, request)
+    assert response.status == 200
+    assert response.json()["value"] == "default-value"
+    assert response.json()["context"] == "default"
+
+
+def test_missing_in_both_contexts_returns_404(overlapped_worker: types.ModuleType) -> None:
+    """A key absent from both the named and default contexts yields 404."""
+    request = FakeRequest("http://vault/secrets/yuktiai/missing", headers=AUTH_HEADER)
+    assert _call(overlapped_worker, request).status == 404
+
+
 def test_unknown_route_returns_404(worker: types.ModuleType) -> None:
     """A non-secrets path yields 404."""
     assert _call(worker, FakeRequest("http://vault/nope", headers=AUTH_HEADER)).status == 404

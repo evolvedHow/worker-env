@@ -150,8 +150,15 @@ class SecretClient:
         Returns:
             The secret with its metadata.
 
+        Note:
+            Named contexts overlay the default (blank) context. When ``key`` is
+            absent from ``context``, the vault serves the default-context value
+            if one exists; a named-context value always wins. A 404 therefore
+            means the key is defined in neither context. Inspect
+            ``secret.context`` to see which context supplied the value.
+
         Raises:
-            SecretNotFoundError: If the secret does not exist.
+            SecretNotFoundError: If the secret exists in neither context.
             AuthenticationError: If the bearer token is invalid.
             VaultError: If the vault returns any other error.
 

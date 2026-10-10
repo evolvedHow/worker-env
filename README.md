@@ -6,7 +6,7 @@ Deploy secrets via `wrangler deploy` with zero infrastructure overhead.
 ## Features
 
 - **CSV-based storage**: Edit `worker/secrets/*.csv` files locally, deploy instantly
-- **Context isolation**: Separate contexts (homelab, finance, commerce, etc.)
+- **Context isolation**: Separate contexts per app (homelab, finance, yuktiai, …), each overlaying the shared default context
 - **Bearer token auth**: Simple API authentication
 - **Read-only distribution**: Update via CSV edit + redeploy (no database writes)
 - **Zero infrastructure**: Cloudflare Workers free tier (100K requests/day)
@@ -254,6 +254,16 @@ github-token,ghp_xxx,GitHub API token,1,2026-10-08T10:30:00Z
 - `secrets.csv` → default context
 - `{context}.secrets.csv` → named contexts (e.g., `homelab.secrets.csv`, `finance.secrets.csv`)
 
+Name each app's context after the app itself — the repo or product name,
+lowercase and joined, e.g. `yuktiai.secrets.csv` → context `yuktiai`.
+
+**Default-context fallback.** Named contexts overlay the default context: a
+lookup for `{context}/{key}` returns the value defined in that context, or the
+default (`secrets.csv`) value for the same key when the named context does not
+define it. A value in the named context always wins over the default. This lets
+you keep shared keys in `secrets.csv` and override them per app only where
+needed.
+
 ## Telemetry
 
 Cloudflare-native observability is enabled by default in `wrangler.toml`:
@@ -384,7 +394,7 @@ This design prioritizes simplicity for your use case (~200 reads/day):
 
 **Trade-offs:**
 - Read-only (updates require redeploy)
-- Secrets loaded into memory on cold start (~100ms)
+- Secrets cached in memory: the default context at cold start, each named context on first access
 - Not suitable for >1000 secrets (memory constraints)
 
 For your workload (few hundred secrets, infrequent changes), CSV is the optimal choice.
