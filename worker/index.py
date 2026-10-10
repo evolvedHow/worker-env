@@ -21,6 +21,7 @@ are named after the app (repo/product name, lowercase, e.g. "yuktiai").
 import csv
 import hmac
 import json
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -162,11 +163,15 @@ def _load_all_contexts() -> None:
     Used by the listing route, which needs all contexts. The default (blank)
     context is always loaded; named contexts are discovered from
     ``*.secrets.csv`` and cached if not already present.
+
+    Uses ``os.listdir`` rather than ``pathlib.Path.glob`` because the deployed
+    Workers VFS supports the former but silently returns nothing for the latter.
     """
     _context(DEFAULT_CONTEXT)
     if SECRETS_DIR.is_dir():
-        for csv_path in sorted(SECRETS_DIR.glob(f"*{CONTEXT_SUFFIX}")):
-            _context(csv_path.name.removesuffix(CONTEXT_SUFFIX))
+        for name in sorted(os.listdir(SECRETS_DIR)):  # noqa: PTH208
+            if name.endswith(CONTEXT_SUFFIX):
+                _context(name.removesuffix(CONTEXT_SUFFIX))
 
 
 def _json(body: Any, status: int = 200) -> Response:
