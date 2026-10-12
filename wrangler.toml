@@ -16,5 +16,19 @@ fallthrough = true
 # Local dev:   echo "VAULT_BEARER_TOKEN=<token>" > .dev.vars
 # The vault fails closed (every request returns 401) while the token is unset.
 
+# Non-secret gateway configuration. Provider API keys are NEVER set here — they
+# live in the CSV vaults below (provider keys) plus the passcode, which gates
+# the paid endpoints when ACCESS_PASSCODE is set.
+[vars]
+# Comma-separated origin allowlist for CORS. "*" allows any origin.
+ALLOWED_ORIGINS = "*"
+# Profile used when a caller does not name one (see worker/providers.py).
+DEFAULT_PROVIDER = "anthropic"
+# Vault context gateways read provider keys from (KEY_<PROVIDER>, ACCESS_PASSCODE).
+VAULT_CONTEXT = "yuktiai"
+# Extra provider profiles beyond the built-ins: JSON array of
+# { id, label, baseUrl, defaultModel, models? }. Keys still read as KEY_<ID>.
+EXTRA_PROVIDERS = "[]"
+
 [observability]
 enabled = true

@@ -7,7 +7,8 @@ Deploy secrets via `wrangler deploy` with zero infrastructure overhead.
 
 - **CSV-based storage**: Edit `worker/secrets/*.csv` files locally, deploy instantly
 - **Context isolation**: Separate contexts per app (homelab, finance, yuktiai, …), each overlaying the shared default context
-- **Bearer token auth**: Simple API authentication
+- **Bearer token auth**: Simple API authentication for the vault routes
+- **LLM gateway**: `/v1/chat/completions` proxy + link verifier, gated by passcode
 - **Read-only distribution**: Update via CSV edit + redeploy (no database writes)
 - **Zero infrastructure**: Cloudflare Workers free tier (100K requests/day)
 - **Python library**: Import and use in your applications
@@ -171,14 +172,19 @@ homelab_secrets = client.list("homelab")
 
 ## HTTP API
 
-All endpoints (except `/health`) require `Authorization: Bearer <token>` header.
+All vault endpoints require `Authorization: Bearer <token>`. The gateway
+endpoints (provider catalogue, chat proxy, link verification) are public or
+passcode-gated as noted below.
 
-| Method | Path                         | Description                                    |
-| ------ | ---------------------------- | ---------------------------------------------- |
-| GET    | `/health`                    | Unauthenticated health check                   |
-| GET    | `/secrets?context=<ctx>`     | List secrets (optional context filter)         |
-| GET    | `/secrets/{context}/{key}`   | Retrieve secret from named context             |
-| GET    | `/secrets/{key}`             | Retrieve secret from default context           |
+| Method | Path                         | Auth                              | Description                            |
+| ------ | ---------------------------- | --------------------------------- | -------------------------------------- |
+| GET    | `/health`                    | none                              | Unauthenticated health check           |
+| GET    | `/secrets?context=<ctx>`     | Bearer token                      | List secrets (optional context filter) |
+| GET    | `/secrets/{context}/{key}`   | Bearer token                      | Retrieve secret from named context     |
+| GET    | `/secrets/{key}`             | Bearer token                      | Retrieve secret from default context   |
+| GET    | `/providers`                 | none                              | LLM provider catalogue (no keys)       |
+| POST   | `/v1/chat/completions`       | `X-Yukti-Passcode` when set       | Proxy to the chosen provider           |
+| POST   | `/verify-links`              | `X-Yukti-Passcode` when set       | Batch link health probe                |
 
 **Note**: PUT and DELETE are not supported in CSV-based mode. Edit CSV files and redeploy.
 
@@ -205,6 +211,71 @@ curl "https://worker-env-vault.<your-subdomain>.workers.dev/secrets?context=home
   -H "Authorization: Bearer <token>"
 ```
 
+## LLM Gateway
+
+The Worker also proxies OpenAI-style chat completions so apps never ship provider
+keys to the browser. Provider definitions live in `worker/providers.py`; keys are
+read from the vault as `KEY_<slug>` (context `yuktiai`, falling back to the default
+context), mirroring `providers.ts` in `codebox/yuktiAI`.
+
+### Provider catalogue (`GET /providers`)
+
+Public and returned with the same shape the yuktiAI frontend expects:
+
+```json
+{
+  "defaultProvider": "anthropic",
+  "requiresPasscode": true,
+  "providers": [
+    {"id": "groq", "label": "Groq", "baseUrl": "https://api.groq.com/openai/v1",
+     "defaultModel": "groq/compound-mini", "models": ["groq/compound-mini"],
+     "hasServerKey": true}
+  ]
+}
+```
+
+`hasServerKey` is true only when the worker has a non-empty `KEY_<slug>` secret for
+that provider. `requiresPasscode` is true when `ACCESS_PASSCODE` is set.
+
+### Chat proxy (`POST /v1/chat/completions`)
+
+Provider key is chosen from (in order): the `X-Yukti-Provider` request header, the
+JSON body `provider` field, then `DEFAULT_PROVIDER`. Unknown providers return 400
+with the known list. The upstream response (including a streaming SSE body) is
+passed through untouched. Every response carries CORS headers honouring
+`ALLOWED_ORIGINS` (default `*`).
+
+```bash
+# 'provider' defaults to anthropic when omitted
+curl -N https://worker-env-vault.<your-subdomain>.workers.dev/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Yukti-Passcode: <passcode>" \
+  -d '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+### Link verification (`POST /verify-links`)
+
+Browsers cannot fetch arbitrary cross-origin sites (CORS), so the gateway probes
+cited URLs server-side. Refuses private/loopback/link-local hosts. Body:
+`{"urls": ["https://example.com", ...]}` (max 12). Returns per-URL veredicts:
+`live`, `missing`, `restricted`, `unreachable`, or `blocked`.
+
+### Passcode gate
+
+Set `ACCESS_PASSCODE` in the `yuktiai` context (or default context) to require the
+`X-Yukti-Passcode` header on the chat and verify-links routes. When unset/empty,
+the routes are open. Comparison is constant-time (SHA-256 + `hmac.compare_digest`).
+The `/providers` route stays public so apps can render the picker before asking for
+a passcode.
+
+Example entry in `worker/secrets/yuktiai.secrets.csv`:
+
+```csv
+ACCESS_PASSCODE,<your-passphrase>,LLM gateway passcode,1,2026-10-12T00:00:00Z
+```
+
+After editing the CSV, redeploy with `npm run deploy`.
+
 ## Configuration
 
 ### Worker Authentication
@@ -224,6 +295,15 @@ For local development, put the token in `.dev.vars` at the repo root (git-ignore
 ```bash
 echo "VAULT_BEARER_TOKEN=<your-token>" > .dev.vars
 ```
+
+### Worker `[vars]` (plaintext, deployed with the Worker)
+
+| Variable            | Default     | Purpose                                        |
+| ------------------- | ----------- | ---------------------------------------------- |
+| `ALLOWED_ORIGINS`   | `*`         | CORS allowlist (comma-separated, or `*`)      |
+| `DEFAULT_PROVIDER`  | `anthropic` | Provider used when the request names none     |
+| `VAULT_CONTEXT`     | `yuktiai`   | Vault context for `KEY_<slug>` lookups        |
+| `EXTRA_PROVIDERS`   | `[]`        | JSON array merging extra providers            |
 
 ### CLI Environment Variables
 

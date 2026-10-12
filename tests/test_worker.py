@@ -53,17 +53,50 @@ class FakeRequest:
         url: str,
         method: str = "GET",
         headers: dict[str, str] | None = None,
+        body: bytes | None = None,
     ) -> None:
         self.url = url
         self.method = method
         self.headers = FakeHeaders(headers or {})
+        self._body = body
+
+    def bytes(self) -> bytes | None:
+        """Return the body bytes set on the request."""
+        return self._body
+
+
+async def _stub_fetch(*_args: Any, **_kwargs: Any) -> Any:
+    """Outbound fetch in tests must be replaced per-test; fail loudly otherwise."""
+    raise NotImplementedError("test must stub the workers fetch")
+
+
+class FakeUpstream:
+    """Minimal stand-in for an outbound fetch response."""
+
+    def __init__(
+        self,
+        status: int,
+        body: object = "",
+        content_type: str = "application/json",
+    ) -> None:
+        self.status = status
+        self.body = body
+        self.headers = {"Content-Type": content_type}
+
+    async def text(self) -> str:
+        """Return the body as text for error details."""
+        return str(self.body)
 
 
 def _load_worker(monkeypatch: pytest.MonkeyPatch, secrets_dir: Path) -> types.ModuleType:
     """Load ``worker/index.py`` with a stubbed SDK and a temporary secrets dir."""
+    worker_dir = str(WORKER_PATH.parent)
+    monkeypatch.syspath_prepend(worker_dir)
+
     fake_workers = types.ModuleType("workers")
     fake_workers.Response = FakeResponse
     fake_workers.WorkerEntrypoint = type("WorkerEntrypoint", (), {})
+    fake_workers.fetch = _stub_fetch
     monkeypatch.setitem(sys.modules, "workers", fake_workers)
 
     spec = importlib.util.spec_from_file_location("worker_index", WORKER_PATH)
@@ -75,12 +108,27 @@ def _load_worker(monkeypatch: pytest.MonkeyPatch, secrets_dir: Path) -> types.Mo
     return module
 
 
+def _env(token: str | None, **extra: Any) -> types.SimpleNamespace:
+    """Build a Worker env with the gateway vars and the given token."""
+    return types.SimpleNamespace(
+        VAULT_BEARER_TOKEN=token,
+        ALLOWED_ORIGINS="*",
+        DEFAULT_PROVIDER="anthropic",
+        VAULT_CONTEXT="yuktiai",
+        EXTRA_PROVIDERS="[]",
+        **extra,
+    )
+
+
 def _call(
-    module: types.ModuleType, request: FakeRequest, token: str | None = TOKEN
+    module: types.ModuleType,
+    request: FakeRequest,
+    token: str | None = TOKEN,
+    env: types.SimpleNamespace | None = None,
 ) -> FakeResponse:
     """Invoke the Worker fetch handler with a configured bearer token."""
     entry = module.Default()
-    entry.env = types.SimpleNamespace(VAULT_BEARER_TOKEN=token)
+    entry.env = env if env is not None else _env(token)
     return asyncio.run(entry.fetch(request))
 
 
@@ -239,3 +287,185 @@ def test_unreadable_context_is_skipped(worker: types.ModuleType) -> None:
     response = _call(worker, FakeRequest("http://vault/secrets", headers=AUTH_HEADER))
     assert response.status == 200
     assert response.json()["count"] == 2
+
+
+# ── Gateway routes ──────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def gateway_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    """A Worker whose vault carries a passcode plus Groq/Anthropic provider keys."""
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    _write(
+        secrets_dir / "secrets.csv",
+        [
+            CSV_HEADER,
+            "ACCESS_PASSCODE,letmein,Shared passcode,0,2026-01-01T00:00:00Z",
+            "KEY_ANTHROPIC,sk-ant-test,Shared Anthropic key,0,2026-01-01T00:00:00Z",
+        ],
+    )
+    _write(
+        secrets_dir / "yuktiai.secrets.csv",
+        [CSV_HEADER, "KEY_GROQ,gsk_groqtest,Groq key,0,2026-01-01T00:00:00Z"],
+    )
+    return _load_worker(monkeypatch, secrets_dir)
+
+
+def test_providers_is_public(gateway_worker: types.ModuleType) -> None:
+    """The provider catalogue needs no token and carries CORS headers."""
+    response = _call(gateway_worker, FakeRequest("http://vault/providers"), token=None)
+    assert response.status == 200
+    body = response.json()
+    assert body["requiresPasscode"] is True
+    assert body["defaultProvider"] == "anthropic"
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+
+
+def test_providers_report_server_keys(gateway_worker: types.ModuleType) -> None:
+    """Keyed profiles report hasServerKey; keys never appear in the payload."""
+    response = _call(gateway_worker, FakeRequest("http://vault/providers"), token=None)
+    providers = {p["id"]: p for p in response.json()["providers"]}
+
+    assert providers["groq"]["hasServerKey"] is True
+    assert providers["anthropic"]["hasServerKey"] is True
+    assert providers["openai"]["hasServerKey"] is False
+    assert providers["groq"]["baseUrl"] == "https://api.groq.com/openai/v1"
+    canned = json.dumps(response.json())
+    assert "gsk_groqtest" not in canned
+    assert "sk-ant-test" not in canned
+
+
+def test_chat_rejects_missing_or_wrong_passcode(gateway_worker: types.ModuleType) -> None:
+    """A COST gateway refuses paid calls without the right passcode."""
+    body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+    req = FakeRequest(
+        "http://vault/v1/chat/completions",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        body=body,
+    )
+    assert _call(gateway_worker, req, token=None).status == 401
+
+    req = FakeRequest(
+        "http://vault/v1/chat/completions",
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "bogus"},
+        body=body,
+    )
+    assert _call(gateway_worker, req, token=None).status == 401
+
+
+def test_chat_proxies_with_server_key(gateway_worker: types.ModuleType) -> None:
+    """A correct passcode lets the gateway forward with the vault key injected."""
+    calls: dict[str, Any] = {}
+
+    async def fake_fetch(url: str, **kwargs: Any) -> FakeUpstream:
+        calls["url"] = url
+        calls["headers"] = kwargs["headers"]
+        calls["body"] = kwargs["body"]
+        return FakeUpstream(
+            200, 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n', "text/event-stream"
+        )
+
+    gateway_worker.fetch = fake_fetch
+
+    body = json.dumps(
+        {
+            "provider": "groq",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "max_tokens": 120,
+        }
+    ).encode()
+    req = FakeRequest(
+        "http://vault/v1/chat/completions",
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "letmein"},
+        body=body,
+    )
+    response = _call(gateway_worker, req, token=None)
+
+    assert response.status == 200
+    assert response.body == 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+    assert calls["url"].endswith("/chat/completions")
+    assert calls["headers"]["Authorization"] == "Bearer gsk_groqtest"
+    sent = json.loads(calls["body"])
+    assert sent["model"] == "groq/compound-mini"
+    assert "provider" not in sent
+
+
+def test_chat_unknown_provider_with_correct_passcode(gateway_worker: types.ModuleType) -> None:
+    """An unknown provider yields a 400 with the known list."""
+    body = json.dumps({"provider": "nope", "messages": []}).encode()
+    req = FakeRequest(
+        "http://vault/v1/chat/completions",
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "letmein"},
+        body=body,
+    )
+    response = _call(gateway_worker, req, token=None)
+    assert response.status == 400
+    assert "groq" in response.json()["detail"]
+
+
+def test_verify_links_requires_passcode(gateway_worker: types.ModuleType) -> None:
+    """Link probing is paid work and gated like chat."""
+    req = FakeRequest(
+        "http://vault/verify-links",
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "bogus"},
+        body=json.dumps({"urls": ["https://example.com"]}).encode(),
+    )
+    response = _call(gateway_worker, req, token=None)
+    assert response.status == 401
+
+
+def test_verify_links_classes_private_host(gateway_worker: types.ModuleType) -> None:
+    """Private/loopback URLs are refused without any outbound request."""
+    req = FakeRequest(
+        "http://vault/verify-links",
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "letmein"},
+        body=json.dumps({"urls": ["http://10.0.0.5/admin"]}).encode(),
+    )
+    response = _call(gateway_worker, req, token=None)
+    assert response.status == 200
+    (result,) = response.json()["results"]
+    assert result["verdict"] == "blocked"
+    assert "private" in result["reason"]
+
+
+def test_verify_links_uses_verdicts_from_stub(gateway_worker: types.ModuleType) -> None:
+    """Verdicts come from actually probing — stubbed here with status codes."""
+
+    async def fake_fetch(url: str, **kwargs: Any) -> FakeUpstream:
+        del kwargs
+        status = 404 if "missing" in url else 200
+        return FakeUpstream(status)
+
+    verify_module = importlib.import_module("verify_links")
+    verify_module.fetch = fake_fetch
+
+    req = FakeRequest(
+        "http://vault/verify-links",
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "letmein"},
+        body=json.dumps(
+            {"urls": ["https://example.com/missing", "https://example.com/live"]}
+        ).encode(),
+    )
+    response = _call(gateway_worker, req, token=None)
+    assert response.status == 200
+    by_url = {r["url"]: r for r in response.json()["results"]}
+    assert by_url["https://example.com/missing"]["verdict"] == "missing"
+    assert by_url["https://example.com/live"]["verdict"] == "live"
+
+
+def test_options_preflight_is_unauthenticated(gateway_worker: types.ModuleType) -> None:
+    """Browsers preflight the gateway routes without a token."""
+    response = _call(
+        gateway_worker, FakeRequest("http://vault/providers", method="OPTIONS"), token=None
+    )
+    assert response.status == 204
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
