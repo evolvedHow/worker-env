@@ -8,7 +8,7 @@ Deploy secrets via `wrangler deploy` with zero infrastructure overhead.
 - **CSV-based storage**: Edit `worker/secrets/*.csv` files locally, deploy instantly
 - **Context isolation**: Separate contexts per app (homelab, finance, yuktiai, …), each overlaying the shared default context
 - **Bearer token auth**: Simple API authentication for the vault routes
-- **LLM gateway**: `/v1/chat/completions` proxy + link verifier, gated by passcode
+- **LLM gateway**: `/v1/chat/completions` proxy + link verifier, keys held server-side
 - **Read-only distribution**: Update via CSV edit + redeploy (no database writes)
 - **Zero infrastructure**: Cloudflare Workers free tier (100K requests/day)
 - **Python library**: Import and use in your applications
@@ -173,8 +173,7 @@ homelab_secrets = client.list("homelab")
 ## HTTP API
 
 All vault endpoints require `Authorization: Bearer <token>`. The gateway
-endpoints (provider catalogue, chat proxy, link verification) are public or
-passcode-gated as noted below.
+endpoints (provider catalogue, chat proxy, link verification) are public.
 
 | Method | Path                         | Auth                              | Description                            |
 | ------ | ---------------------------- | --------------------------------- | -------------------------------------- |
@@ -183,8 +182,8 @@ passcode-gated as noted below.
 | GET    | `/secrets/{context}/{key}`   | Bearer token                      | Retrieve secret from named context     |
 | GET    | `/secrets/{key}`             | Bearer token                      | Retrieve secret from default context   |
 | GET    | `/providers`                 | none                              | LLM provider catalogue (no keys)       |
-| POST   | `/v1/chat/completions`       | `X-Yukti-Passcode` when set       | Proxy to the chosen provider           |
-| POST   | `/verify-links`              | `X-Yukti-Passcode` when set       | Batch link health probe                |
+| POST   | `/v1/chat/completions`       | none                              | Proxy to the chosen provider           |
+| POST   | `/verify-links`              | none                              | Batch link health probe                |
 
 **Note**: PUT and DELETE are not supported in CSV-based mode. Edit CSV files and redeploy.
 
@@ -225,7 +224,7 @@ Public and returned with the same shape the yuktiAI frontend expects:
 ```json
 {
   "defaultProvider": "anthropic",
-  "requiresPasscode": true,
+  "requiresPasscode": false,
   "providers": [
     {"id": "groq", "label": "Groq", "baseUrl": "https://api.groq.com/openai/v1",
      "defaultModel": "groq/compound-mini", "models": ["groq/compound-mini"],
@@ -235,7 +234,8 @@ Public and returned with the same shape the yuktiAI frontend expects:
 ```
 
 `hasServerKey` is true only when the worker has a non-empty `KEY_<slug>` secret for
-that provider. `requiresPasscode` is true when `ACCESS_PASSCODE` is set.
+that provider. `requiresPasscode` is retained for client compatibility and is
+always `false`.
 
 ### Chat proxy (`POST /v1/chat/completions`)
 
@@ -249,7 +249,6 @@ passed through untouched. Every response carries CORS headers honouring
 # 'provider' defaults to anthropic when omitted
 curl -N https://worker-env-vault.<your-subdomain>.workers.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-Yukti-Passcode: <passcode>" \
   -d '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
@@ -260,21 +259,21 @@ cited URLs server-side. Refuses private/loopback/link-local hosts. Body:
 `{"urls": ["https://example.com", ...]}` (max 12). Returns per-URL veredicts:
 `live`, `missing`, `restricted`, `unreachable`, or `blocked`.
 
-### Passcode gate
+### Provider keys
 
-Set `ACCESS_PASSCODE` in the `yuktiai` context (or default context) to require the
-`X-Yukti-Passcode` header on the chat and verify-links routes. When unset/empty,
-the routes are open. Comparison is constant-time (SHA-256 + `hmac.compare_digest`).
-The `/providers` route stays public so apps can render the picker before asking for
-a passcode.
+Provider keys are read from a direct Worker secret first (`KEY_<slug>`, set with
+`npx wrangler secret put` or the dashboard), then from the vault CSVs. Set them as
+Worker secrets to keep deployments independent of the git-ignored CSV files:
 
-Example entry in `worker/secrets/yuktiai.secrets.csv`:
-
-```csv
-ACCESS_PASSCODE,<your-passphrase>,LLM gateway passcode,1,2026-10-12T00:00:00Z
+```bash
+npx wrangler secret put KEY_GROQ
+npx wrangler secret put KEY_ANTHROPIC
+npx wrangler secret put KEY_GOOGLE
 ```
 
-After editing the CSV, redeploy with `npm run deploy`.
+Worker secrets survive `wrangler deploy`, so a checkout without `worker/secrets/`
+still serves the keys. The `/providers` route stays public and reports only
+`hasServerKey` booleans.
 
 ## Configuration
 

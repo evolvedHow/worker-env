@@ -7,12 +7,11 @@ Two roles in one Worker, so every app can point at one canonical deployment:
    context: ``{context}/{key}`` returns the named context's value, or the
    default-context value when the named context does not define the key.
 
-2. **LLM gateway** — holds provider API keys server-side (from the vault CSVs,
-   never in the browser) and proxies OpenAI-style chat completions. The static
-   frontend picks a provider from ``GET /providers``, sends a passphrase when
-   ``ACCESS_PASSCODE`` is set, and streams from ``POST /v1/chat/completions``.
-   ``POST /verify-links`` probes cited URLs for the fact-check pass — a browser
-   cannot do that because of CORS.
+2. **LLM gateway** — holds provider API keys server-side (from Worker secrets
+   or the vault CSVs, never in the browser) and proxies OpenAI-style chat
+   completions. The static frontend picks a provider from ``GET /providers``
+   and streams from ``POST /v1/chat/completions``. ``POST /verify-links`` probes
+   cited URLs for the fact-check pass — a browser cannot do that because of CORS.
 
 File layout (bundled below the worker entry point):
 
@@ -25,21 +24,20 @@ Routes
     OPTIONS *                              CORS preflight
     GET     /health                        liveness (unauthenticated)
     GET     /providers                     provider catalogue, public (no secrets)
-    POST    /v1/chat/completions           OpenAI-compatible proxy (passcode-gated)
-    POST    /verify-links                  URL probe for fact-checking (passcode-gated)
+    POST    /v1/chat/completions           OpenAI-compatible proxy
+    POST    /verify-links                  URL probe for fact-checking
     GET     /secrets[?context=...]         list secrets (bearer token required)
     GET     /secrets/{context}/{key}       read one secret, default-context fallback
     GET     /secrets/{key}                 read from the default context
 
 Authentication
     /secrets* — ``Authorization: Bearer <VAULT_BEARER_TOKEN>``.
-    /v1/* and /verify-links — ``X-Yukti-Passcode`` when ACCESS_PASSCODE is set in
-    the vault. The provider keys themselves stay server-side.
+    Provider keys are read from Worker secrets first, then the vault CSVs.
+    The provider keys themselves stay server-side.
     /health and /providers — public.
 """
 
 import csv
-import hashlib
 import hmac
 import json
 import os
@@ -66,9 +64,7 @@ KEY_PATH_SEGMENTS = 2
 # Reject oversized bodies before parsing — debate history is well under this.
 MAX_BODY_BYTES = 1_000_000
 
-ALLOWED_REQUEST_HEADERS = (
-    "authorization, content-type, x-yukti-provider, x-yukti-passcode, http-referer, x-title"
-)
+ALLOWED_REQUEST_HEADERS = "authorization, content-type, x-yukti-provider, http-referer, x-title"
 
 # In-memory cache: {context: {key: secret_record}}. The default (blank) context
 # is primed on the first request and kept for the life of the isolate; named
@@ -270,37 +266,23 @@ def _cors_headers(env: Any, origin: str | None) -> dict[str, str]:
     return headers
 
 
-def _constant_time_equals(a: str, b: str) -> bool:
-    """Compare two strings without leaking their contents via length/timing.
-
-    Both sides are hashed first so the comparison length is always identical.
-
-    Args:
-        a: First secret.
-        b: Second secret.
-
-    Returns:
-        True when the strings are identical.
-    """
-    return hmac.compare_digest(
-        hashlib.sha256(a.encode("utf-8")).digest(),
-        hashlib.sha256(b.encode("utf-8")).digest(),
-    )
-
-
 def _secret_value(env: Any, name: str) -> str | None:
-    """Return a secret's value, overlaying the default context on a named one.
+    """Return a secret's value, preferring a Worker secret over the vault.
 
-    The named context always wins when it defines the key; otherwise the default
-    context is consulted. An absent key or a blank value resolves to None.
+    A direct Worker binding (``env.<name>``) wins; otherwise the named context
+    is consulted, falling back to the default context. An absent key or a blank
+    value resolves to None.
 
     Args:
-        env: Worker bindings (for VAULT_CONTEXT).
-        name: Secret key, e.g. "KEY_GROQ" or "ACCESS_PASSCODE".
+        env: Worker bindings (for VAULT_CONTEXT and direct secrets).
+        name: Secret key, e.g. "KEY_GROQ".
 
     Returns:
         The secret value, or None when it is configured nowhere (or blank).
     """
+    direct = getattr(env, name, None)
+    if isinstance(direct, str) and direct:
+        return direct
     context = str(getattr(env, "VAULT_CONTEXT", "") or DEFAULT_VAULT_CONTEXT)
     record = _context(context).get(name)
     if record is None and context != DEFAULT_CONTEXT:
@@ -445,10 +427,9 @@ class Default(WorkerEntrypoint):
             cors: CORS response headers.
 
         Returns:
-            Envelope with providers, the default, and whether a passcode is set.
+            Envelope with providers and the default provider.
         """
         profiles = resolve_profiles(getattr(self.env, "EXTRA_PROVIDERS", None))
-        passcode = _secret_value(self.env, "ACCESS_PASSCODE") is not None
         providers = [
             {
                 "id": p.id,
@@ -467,7 +448,7 @@ class Default(WorkerEntrypoint):
         return _json(
             {
                 "defaultProvider": default_provider,
-                "requiresPasscode": passcode,
+                "requiresPasscode": False,
                 "providers": providers,
             },
             headers=cors,
@@ -478,8 +459,9 @@ class Default(WorkerEntrypoint):
 
         Provider selection: the ``X-Yukti-Provider`` header wins, then a
         ``provider`` field in the body, then the deployment default. The key is
-        read from the vault server-side and injected here; it never reaches the
-        caller. The upstream SSE body is passed straight through.
+        read from Worker secrets or the vault server-side and injected here; it
+        never reaches the caller. The upstream SSE body is passed straight
+        through.
 
         Args:
             request: Incoming HTTP request.
@@ -488,10 +470,6 @@ class Default(WorkerEntrypoint):
         Returns:
             The upstream response (streamed), or an error envelope.
         """
-        denied = await self._guard_paid(request, cors)
-        if denied is not None:
-            return denied
-
         raw = await self._read_body(request, cors)
         if isinstance(raw, Response):
             return raw
@@ -565,10 +543,6 @@ class Default(WorkerEntrypoint):
         Returns:
             Envelope with per-URL results.
         """
-        denied = await self._guard_paid(request, cors)
-        if denied is not None:
-            return denied
-
         raw = await self._read_body(request, cors)
         if isinstance(raw, Response):
             return raw
@@ -601,24 +575,6 @@ class Default(WorkerEntrypoint):
         body_provider = body.get("provider") if isinstance(body.get("provider"), str) else ""
         body.pop("provider", None)
         return (header or body_provider or default).strip()
-
-    async def _guard_paid(self, request: Any, cors: dict[str, str]) -> Response | None:
-        """Passcode check shared by every endpoint that spends money.
-
-        Args:
-            request: Incoming HTTP request.
-            cors: CORS response headers.
-
-        Returns:
-            An error response when the passcode is missing, else None.
-        """
-        passcode = _secret_value(self.env, "ACCESS_PASSCODE")
-        if passcode is None:
-            return None
-        supplied = request.headers.get("X-Yukti-Passcode") or ""
-        if not _constant_time_equals(supplied, passcode):
-            return _error(401, "Invalid or missing passcode.", headers=cors)
-        return None
 
     async def _read_body(self, request: Any, cors: dict[str, str]) -> dict[str, Any] | Response:
         """Read and parse a request body as JSON, bounding its size.

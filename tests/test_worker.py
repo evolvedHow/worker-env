@@ -294,14 +294,13 @@ def test_unreadable_context_is_skipped(worker: types.ModuleType) -> None:
 
 @pytest.fixture
 def gateway_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
-    """A Worker whose vault carries a passcode plus Groq/Anthropic provider keys."""
+    """A Worker whose vault carries Groq/Anthropic provider keys."""
     secrets_dir = tmp_path / "secrets"
     secrets_dir.mkdir()
     _write(
         secrets_dir / "secrets.csv",
         [
             CSV_HEADER,
-            "ACCESS_PASSCODE,letmein,Shared passcode,0,2026-01-01T00:00:00Z",
             "KEY_ANTHROPIC,sk-ant-test,Shared Anthropic key,0,2026-01-01T00:00:00Z",
         ],
     )
@@ -317,7 +316,7 @@ def test_providers_is_public(gateway_worker: types.ModuleType) -> None:
     response = _call(gateway_worker, FakeRequest("http://vault/providers"), token=None)
     assert response.status == 200
     body = response.json()
-    assert body["requiresPasscode"] is True
+    assert body["requiresPasscode"] is False
     assert body["defaultProvider"] == "anthropic"
     assert response.headers["Access-Control-Allow-Origin"] == "*"
 
@@ -336,28 +335,31 @@ def test_providers_report_server_keys(gateway_worker: types.ModuleType) -> None:
     assert "sk-ant-test" not in canned
 
 
-def test_chat_rejects_missing_or_wrong_passcode(gateway_worker: types.ModuleType) -> None:
-    """A COST gateway refuses paid calls without the right passcode."""
-    body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
-    req = FakeRequest(
-        "http://vault/v1/chat/completions",
-        method="POST",
-        headers={"Content-Type": "application/json"},
-        body=body,
-    )
-    assert _call(gateway_worker, req, token=None).status == 401
+def test_worker_secret_precedes_vault(gateway_worker: types.ModuleType) -> None:
+    """A direct Worker secret wins, with vault values still serving as fallback."""
+    captured: list[str] = []
 
-    req = FakeRequest(
-        "http://vault/v1/chat/completions",
-        method="POST",
-        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "bogus"},
-        body=body,
-    )
-    assert _call(gateway_worker, req, token=None).status == 401
+    async def fake_fetch(_url: str, **kwargs: Any) -> FakeUpstream:
+        captured.append(kwargs["headers"]["Authorization"])
+        return FakeUpstream(200, "{}", "application/json")
+
+    gateway_worker.fetch = fake_fetch
+    env = _env(None, KEY_GROQ="gsk_envkey")
+
+    for provider in ("groq", "anthropic"):
+        req = FakeRequest(
+            "http://vault/v1/chat/completions",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"provider": provider, "messages": []}).encode(),
+        )
+        assert _call(gateway_worker, req, token=None, env=env).status == 200
+
+    assert captured == ["Bearer gsk_envkey", "Bearer sk-ant-test"]
 
 
 def test_chat_proxies_with_server_key(gateway_worker: types.ModuleType) -> None:
-    """A correct passcode lets the gateway forward with the vault key injected."""
+    """The gateway forwards with the server-held key injected."""
     calls: dict[str, Any] = {}
 
     async def fake_fetch(url: str, **kwargs: Any) -> FakeUpstream:
@@ -381,7 +383,7 @@ def test_chat_proxies_with_server_key(gateway_worker: types.ModuleType) -> None:
     req = FakeRequest(
         "http://vault/v1/chat/completions",
         method="POST",
-        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "letmein"},
+        headers={"Content-Type": "application/json"},
         body=body,
     )
     response = _call(gateway_worker, req, token=None)
@@ -395,13 +397,13 @@ def test_chat_proxies_with_server_key(gateway_worker: types.ModuleType) -> None:
     assert "provider" not in sent
 
 
-def test_chat_unknown_provider_with_correct_passcode(gateway_worker: types.ModuleType) -> None:
+def test_chat_unknown_provider(gateway_worker: types.ModuleType) -> None:
     """An unknown provider yields a 400 with the known list."""
     body = json.dumps({"provider": "nope", "messages": []}).encode()
     req = FakeRequest(
         "http://vault/v1/chat/completions",
         method="POST",
-        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "letmein"},
+        headers={"Content-Type": "application/json"},
         body=body,
     )
     response = _call(gateway_worker, req, token=None)
@@ -409,24 +411,12 @@ def test_chat_unknown_provider_with_correct_passcode(gateway_worker: types.Modul
     assert "groq" in response.json()["detail"]
 
 
-def test_verify_links_requires_passcode(gateway_worker: types.ModuleType) -> None:
-    """Link probing is paid work and gated like chat."""
-    req = FakeRequest(
-        "http://vault/verify-links",
-        method="POST",
-        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "bogus"},
-        body=json.dumps({"urls": ["https://example.com"]}).encode(),
-    )
-    response = _call(gateway_worker, req, token=None)
-    assert response.status == 401
-
-
 def test_verify_links_classes_private_host(gateway_worker: types.ModuleType) -> None:
     """Private/loopback URLs are refused without any outbound request."""
     req = FakeRequest(
         "http://vault/verify-links",
         method="POST",
-        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "letmein"},
+        headers={"Content-Type": "application/json"},
         body=json.dumps({"urls": ["http://10.0.0.5/admin"]}).encode(),
     )
     response = _call(gateway_worker, req, token=None)
@@ -450,7 +440,7 @@ def test_verify_links_uses_verdicts_from_stub(gateway_worker: types.ModuleType) 
     req = FakeRequest(
         "http://vault/verify-links",
         method="POST",
-        headers={"Content-Type": "application/json", "X-Yukti-Passcode": "letmein"},
+        headers={"Content-Type": "application/json"},
         body=json.dumps(
             {"urls": ["https://example.com/missing", "https://example.com/live"]}
         ).encode(),
